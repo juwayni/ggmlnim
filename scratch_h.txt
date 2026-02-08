@@ -1,0 +1,15 @@
+        // compute data
+        enum ggml_op op;
+
+        // op params - allocated as int32_t for alignment
+        int32_t op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+
+        int32_t flags;
+
+        struct ggml_tensor * src[GGML_MAX_SRC];
+
+        // source tensor and offset for views
+        struct ggml_tensor * view_src;
+        size_t               view_offs;
+
+        void * data;

@@ -1,0 +1,199 @@
+#define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
+#define _USE_MATH_DEFINES // For M_PI on MSVC
+
+#include "ggml-backend-impl.h"
+#include "ggml-backend.h"
+#include "traits.h"
+#include "ggml-cpu-impl.h"
+#include "ggml-impl.h"
+#include "quants.h"
+#include "ggml-threading.h"
+#include "unary-ops.h"
+#include "binary-ops.h"
+#include "vec.h"
+#include "ops.h"
+#include "ggml.h"
+#include "common.h"
+
+#if defined(_MSC_VER) || defined(__MINGW32__)
+#include <malloc.h> // using malloc.h with MSC/MINGW
+#elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
+#include <alloca.h>
+#endif
+
+#include <assert.h>
+#include <errno.h>
+#include <time.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <float.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <signal.h>
+#if defined(__gnu_linux__)
+#include <syscall.h>
+#endif
+
+#ifdef GGML_USE_OPENMP
+#include <omp.h>
+#endif
+
+#if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
+#undef GGML_USE_LLAMAFILE
+#endif
+
+#ifdef GGML_USE_LLAMAFILE
+#include "llamafile/sgemm.h"
+#endif
+
+// Note: once we move threading into a separate C++ file
+// will use std::hardware_destructive_interference_size instead of hardcoding it here
+// and we'll use C++ attribute syntax.
+#define GGML_CACHE_LINE  64
+
+#if defined(__clang__) || defined(__GNUC__)
+#define GGML_CACHE_ALIGN __attribute__((aligned(GGML_CACHE_LINE)))
+#endif
+
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define GGML_TSAN_ENABLED 1
+#endif
+#else  // __has_feature
+#if defined(__SANITIZE_THREAD__)
+#define GGML_TSAN_ENABLED 1
+#endif
+#endif // __has_feature
+
+#define UNUSED GGML_UNUSED
+#define SWAP(x, y, T) do { T SWAP = x; (x) = y; (y) = SWAP; } while (0)
+
+// precomputed f32 table for f16 (256 KB) (simd-mappings.h)
+float ggml_table_f32_f16[1 << 16];
+
+// precomputed f32 table for e8m0 half (1 KB) (simd-mappings.h)
+float ggml_table_f32_e8m0_half[1 << 8];
+
+#if defined(__ARM_ARCH)
+struct ggml_arm_arch_features_type {
+    int sve_cnt;
+} ggml_arm_arch_features = { 0 };
+#endif
+
+#if defined(__riscv)
+struct ggml_riscv_arch_features_type {
+    int rvv_vlen;
+} ggml_riscv_arch_features = { 0 };
+#endif
+
+#if defined(_WIN32)
+
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+    #define NOMINMAX
+#endif
+#include <windows.h>
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#define GGML_CACHE_ALIGN __declspec(align(GGML_CACHE_LINE))
+
+typedef volatile LONG atomic_int;
+typedef atomic_int atomic_bool;
+typedef atomic_int atomic_flag;
+
+#define ATOMIC_FLAG_INIT 0
+
+typedef enum {
+    memory_order_relaxed,
+    memory_order_consume,
+    memory_order_acquire,
+    memory_order_release,
+    memory_order_acq_rel,
+    memory_order_seq_cst
+} memory_order;
+
+static void atomic_store(atomic_int * ptr, LONG val) {
+    InterlockedExchange(ptr, val);
+}
+static void atomic_store_explicit(atomic_int * ptr, LONG val, memory_order mo) {
+    // TODO: add support for explicit memory order
+    InterlockedExchange(ptr, val);
+}
+static LONG atomic_load(atomic_int * ptr) {
+    return InterlockedCompareExchange(ptr, 0, 0);
+}
+static LONG atomic_load_explicit(atomic_int * ptr, memory_order mo) {
+    // TODO: add support for explicit memory order
+    return InterlockedCompareExchange(ptr, 0, 0);
+}
+static LONG atomic_fetch_add(atomic_int * ptr, LONG inc) {
+    return InterlockedExchangeAdd(ptr, inc);
+}
+static LONG atomic_fetch_add_explicit(atomic_int * ptr, LONG inc, memory_order mo) {
+    // TODO: add support for explicit memory order
+    return InterlockedExchangeAdd(ptr, inc);
+}
+static atomic_bool atomic_flag_test_and_set(atomic_flag * ptr) {
+    return InterlockedExchange(ptr, 1);
+}
+static void atomic_flag_clear(atomic_flag * ptr) {
+    InterlockedExchange(ptr, 0);
+}
+static void atomic_thread_fence(memory_order mo) {
+    MemoryBarrier();
+}
+#else // clang
+#include <stdatomic.h>
+#endif
+
+typedef HANDLE pthread_t;
+
+typedef DWORD thread_ret_t;
+static int pthread_create(pthread_t * out, void * unused, thread_ret_t(*func)(void *), void * arg) {
+    (void) unused;
+    HANDLE handle = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE) func, arg, 0, NULL);
+    if (handle == NULL)
+    {
+        return EAGAIN;
+    }
+
+    *out = handle;
+    return 0;
+}
+
+static int pthread_join(pthread_t thread, void * unused) {
+    (void) unused;
+    int ret = (int) WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    return ret;
+}
+
+static int sched_yield (void) {
+    Sleep (0);
+    return 0;
+}
+#else
+
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sched.h>
+#if defined(__FreeBSD__)
+#include <pthread_np.h>
+#endif
+
+typedef void * thread_ret_t;
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#endif
+
+typedef pthread_t ggml_thread_t;
+
+#define GGML_THREADPOOL_N_THREADS_MASK (0xffffU)
+#define GGML_THREADPOOL_N_THREADS_BITS (16)

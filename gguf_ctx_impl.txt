@@ -1,0 +1,45 @@
+            : key(key), is_array(true), type(GGUF_TYPE_STRING) {
+        GGML_ASSERT(!key.empty());
+        data_string = value;
+    }
+
+    const std::string & get_key() const {
+        return key;
+    }
+
+    const enum gguf_type & get_type() const {
+        return type;
+    }
+
+    size_t get_ne() const {
+        if (type == GGUF_TYPE_STRING) {
+            const size_t ne = data_string.size();
+            GGML_ASSERT(is_array || ne == 1);
+            return ne;
+        }
+        const size_t type_size = gguf_type_size(type);
+        GGML_ASSERT(data.size() % type_size == 0);
+        const size_t ne = data.size() / type_size;
+        GGML_ASSERT(is_array || ne == 1);
+        return ne;
+    }
+
+    template <typename T>
+    const T & get_val(const size_t i = 0) const {
+        GGML_ASSERT(type_to_gguf_type<T>::value == type);
+        if constexpr (std::is_same<T, std::string>::value) {
+            GGML_ASSERT(data_string.size() >= i+1);
+            return data_string[i];
+        }
+        const size_t type_size = gguf_type_size(type);
+        GGML_ASSERT(data.size() % type_size == 0);
+        GGML_ASSERT(data.size() >= (i+1)*type_size);
+        return reinterpret_cast<const T *>(data.data())[i];
+    }
+
+    void cast(const enum gguf_type new_type) {
+        const size_t new_type_size = gguf_type_size(new_type);
+        GGML_ASSERT(data.size() % new_type_size == 0);
+        type = new_type;
+    }
+};
