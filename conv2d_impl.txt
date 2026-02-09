@@ -1,0 +1,32 @@
+    GGML_ASSERT(ggml_is_contiguous(a));
+    // as only the shape of b is relevant, and not its memory layout, b is allowed to be non contiguous.
+    GGML_ASSERT(ggml_nelements(a) == ggml_nelements(b));
+
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, GGML_MAX_DIMS, b->ne, a, 0);
+    ggml_format_name(result, "%s (reshaped)", a->name);
+
+    result->op     = GGML_OP_RESHAPE;
+    result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_reshape_1d(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int64_t               ne0) {
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_nelements(a) == ne0);
+
+    const int64_t ne[1] = { ne0 };
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 1, ne, a, 0);
+    ggml_format_name(result, "%s (reshaped)", a->name);
+
+    result->op     = GGML_OP_RESHAPE;
+    result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_reshape_2d(
+        struct ggml_context * ctx,

@@ -1,0 +1,18 @@
+    result->op     = GGML_OP_GROUP_NORM;
+    result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_group_norm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_groups,
+        float                 eps) {
+    return ggml_group_norm_impl(ctx, a, n_groups, eps, false);
+}
+
+struct ggml_tensor * ggml_group_norm_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_groups,
